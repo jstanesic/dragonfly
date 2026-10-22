@@ -110,13 +110,20 @@ struct SearchIndexLookup {
   SearchIndexLookup& operator=(SearchIndexLookup&&) = delete;
 
   ~SearchIndexLookup() {
-    if (armed_)
-      tx_->Conclude();
+    Conclude();
   }
 
   void Resolve(string_view requested_name);
 
   void Resolve(absl::Span<const string_view> req_names, std::vector<std::string>* canon_names);
+
+  void Conclude() {
+    if (!armed_)
+      return;
+    // Reply writes may block on socket backpressure, so conclude before replying while armed.
+    tx_->Conclude();
+    armed_ = false;
+  }
 
   void CancelConclude() {
     // Call only after transaction has completed a concluding hop already and doesnt need to
@@ -1754,28 +1761,33 @@ bool CreateHnswIndices(std::string_view idx_name, const DocIndex& index, uint32_
 // On failure, sends an error reply via builder and returns nullptr.
 std::shared_ptr<search::HnswVectorIndex> GetValidatedHnswRangeIndex(
     std::string_view index_name, const search::AstVectorRangeNode* hnsw_range,
-    SinkReplyBuilder* builder) {
+    SearchIndexLookup& index_lookup, SinkReplyBuilder* builder) {
   auto hnsw_index = GlobalHnswIndexRegistry::Instance().Get(index_name, hnsw_range->field);
   if (!hnsw_index) {
+    index_lookup.Conclude();
     builder->SendError(string{index_name} + ": no such global hnsw index");
     return nullptr;
   }
   const size_t width = search::ElementSize(hnsw_index->GetDataType());
   if (hnsw_range->blob.empty() || hnsw_range->blob.size() % width != 0) {
+    index_lookup.Conclude();
     builder->SendError("Parse error of vector parameters");
     return nullptr;
   }
   if (!(hnsw_range->radius >= 0) || !std::isfinite(hnsw_range->radius)) {
+    index_lookup.Conclude();
     builder->SendError(
         absl::StrCat("VECTOR_RANGE radius must be non-negative, got: ", hnsw_range->radius));
     return nullptr;
   }
   if (hnsw_range->epsilon &&
       !search::SchemaField::VectorParams::IsValidRuntimeHnswEpsilon(*hnsw_range->epsilon)) {
+    index_lookup.Conclude();
     builder->SendError("VECTOR_RANGE EPSILON must be greater than zero");
     return nullptr;
   }
   if (hnsw_index->GetDim() * width != hnsw_range->blob.size()) {
+    index_lookup.Conclude();
     builder->SendError(
         absl::StrCat("Wrong vector index dimensions, got: ", hnsw_range->blob.size() / width,
                      ", expected: ", hnsw_index->GetDim()));
@@ -2399,6 +2411,7 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
   SearchIndexLookup index_lookup{cmd_cntx->tx()};
   index_lookup.Resolve(requested_index_name);
   if (!index_lookup.canonical_name) {
+    index_lookup.Conclude();
     cmd_cntx->SendError(string{requested_index_name} + ": no such index");
     return false;
   }
@@ -2412,10 +2425,12 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
   vector<SearchResult> flat_knn_docs(shard_count);
   if (!use_hnsw) {
     if (params->use_range && params->range_epsilon) {
+      index_lookup.Conclude();
       rb->SendError("EPSILON is supported only for HNSW VECTOR_RANGE");
       return false;
     }
     if (params->query_params[params->vsim_param].empty()) {
+      index_lookup.Conclude();
       rb->SendError(absl::StrCat("Vector parameter not found: $", params->vsim_param));
       return false;
     }
@@ -2434,6 +2449,7 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
                                   ef_suffix);
     }
     if (!knn_algo.Init(knn_query, &params->query_params, nullptr)) {
+      index_lookup.Conclude();
       rb->SendError("KNN query error for VSIM field");
       return false;
     }
@@ -2446,6 +2462,7 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
   vector<SearchResult> hnsw_filter_docs(shard_count);
   if (use_hnsw && have_filter) {
     if (!filter_algo.Init(params->vsim_filter, &params->query_params, nullptr)) {
+      index_lookup.Conclude();
       rb->SendError("Query syntax error in VSIM FILTER clause");
       return false;
     }
@@ -2455,11 +2472,13 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
     // Pre-flight dim check spares us a multi-shard text+filter hop on a bad query vector.
     auto hnsw_index = GlobalHnswIndexRegistry::Instance().Get(index_name, params->vsim_field);
     if (!hnsw_index) {
+      index_lookup.Conclude();
       rb->SendError(absl::StrCat("No HNSW index for field: ", params->vsim_field));
       return false;
     }
     std::string_view blob_ignored;
     if (auto err = ValidateAndExtractHnswVector(*hnsw_index, *params, &blob_ignored)) {
+      index_lookup.Conclude();
       rb->SendError(*err);
       return false;
     }
@@ -2468,6 +2487,7 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
   search::GlobalScoringStats global_stats;
   if (needs_global_stats && !CollectGlobalScoringStats(index_name, text_algo, cmd_cntx->tx(),
                                                        shard_count, global_stats)) {
+    index_lookup.Conclude();
     cmd_cntx->SendError(string{requested_index_name} + ": no such index");
     return false;
   }
@@ -2478,6 +2498,7 @@ bool RunHybridSearch(string_view index_name, HybridSearchParams* params, Command
   if (use_hnsw && !have_filter) {
     const absl::Time t = absl::Now();
     if (auto err = RunHnswPreSearch(index_name, *params, hnsw_shard_docs)) {
+      index_lookup.Conclude();
       rb->SendError(*err);
       return false;
     }
@@ -3210,8 +3231,10 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
 
   SearchIndexLookup index_lookup{cmd_cntx->tx()};
   index_lookup.Resolve(requested_index_name);
-  if (!index_lookup.canonical_name)
+  if (!index_lookup.canonical_name) {
+    index_lookup.Conclude();
     return cmd_cntx->SendError(string{requested_index_name} + ": no such index");
+  }
   index_name = *index_lookup.canonical_name;
 
   auto [knn_node, knn] = TryPopHnswKnnNode(search_algo, index_name);
@@ -3227,6 +3250,7 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
         std::any_of(ranges.begin(), ranges.end(), [&](const search::AstVectorRangeNode* r) {
           return GlobalHnswIndexRegistry::Instance().Exist(index_name, r->field);
         })) {
+      index_lookup.Conclude();
       return builder->SendError(
           "Combining multiple VECTOR_RANGE clauses with an HNSW index is not supported");
     }
@@ -3238,6 +3262,7 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
           hnsw_range_holder = search_algo.ExtractVectorRangeAsPrefilter();
           hnsw_range_prefilter = hnsw_range_holder->As<search::AstVectorRangeNode>();
         } else {
+          index_lookup.Conclude();
           return builder->SendError(
               "Combining VECTOR_RANGE with OR/NOT is not supported on HNSW indexes");
         }
@@ -3274,6 +3299,7 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
         false);
 
     if (index_not_found.load(memory_order_relaxed)) {
+      index_lookup.Conclude();
       return cmd_cntx->SendError(string{requested_index_name} + ": no such index");
     }
 
@@ -3310,6 +3336,7 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
     }
 
     if (index_not_found.load(memory_order_relaxed)) {
+      index_lookup.Conclude();
       return cmd_cntx->SendError(string{requested_index_name} + ": no such index");
     }
 
@@ -3317,6 +3344,7 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
       for (const auto& res : knn_prefilter_docs) {
         empty_prefilter_result &= res.ids.empty();
         if (res.error) {
+          index_lookup.Conclude();
           return cmd_cntx->SendError(*res.error);
         }
       }
@@ -3332,9 +3360,11 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
   if (knn_node && (!knn_has_prefilter || !empty_prefilter_result)) {
     auto hnsw_index = GlobalHnswIndexRegistry::Instance().Get(index_name, knn->field);
     if (!hnsw_index) {
+      index_lookup.Conclude();
       return builder->SendError(string{requested_index_name} + ": no such global hnsw index");
     }
     if (auto err = ValidateHnswKnnBlob(knn, *hnsw_index)) {
+      index_lookup.Conclude();
       return builder->SendError(*err);
     }
     if (knn_has_prefilter) {
@@ -3350,7 +3380,7 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
   auto knn_sort_option = search_algo.GetKnnScoreSortOption();
 
   if (hnsw_range) {
-    auto hnsw_index = GetValidatedHnswRangeIndex(index_name, hnsw_range, builder);
+    auto hnsw_index = GetValidatedHnswRangeIndex(index_name, hnsw_range, index_lookup, builder);
     if (!hnsw_index)
       return;
     if (!hnsw_range->score_alias.empty())
@@ -3364,7 +3394,8 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
   // `docs` holds the pre-filter matches from the per-shard search above; intersect RangeQuery
   // with them. Empty pre-filter -> empty result, so `docs` is left as-is.
   if (hnsw_range_prefilter && !empty_prefilter_result) {
-    auto hnsw_index = GetValidatedHnswRangeIndex(index_name, hnsw_range_prefilter, builder);
+    auto hnsw_index =
+        GetValidatedHnswRangeIndex(index_name, hnsw_range_prefilter, index_lookup, builder);
     if (!hnsw_index)
       return;
     if (!hnsw_range_prefilter->score_alias.empty())
@@ -3393,6 +3424,8 @@ void CmdFtSearch(CmdArgParser parser, CommandContext* cmd_cntx) {
   docs.insert(docs.end(), std::make_move_iterator(css_docs.begin()),
               std::make_move_iterator(css_docs.end()));
 
+  // An empty KNN prefilter skips the final search hop.
+  index_lookup.Conclude();
   SearchReply(*params, knn_sort_option, inject_score_alias, absl::MakeSpan(docs), builder,
               is_cross_shard);
 }
@@ -3538,17 +3571,23 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
 
   SearchIndexLookup index_lookup{cmd_cntx->tx()};
   index_lookup.Resolve(requested_index_name);
-  if (!index_lookup.canonical_name)
+  if (!index_lookup.canonical_name) {
+    index_lookup.Conclude();
     return cmd_cntx->SendError(std::string{requested_index_name} + ": no such index");
+  }
   index_name = *index_lookup.canonical_name;
 
   auto [profile_knn_node, profile_knn] = TryPopHnswKnnNode(search_algo, index_name);
   if (profile_knn) {
     auto hnsw_index = GlobalHnswIndexRegistry::Instance().Get(index_name, profile_knn->field);
-    if (!hnsw_index)
+    if (!hnsw_index) {
+      index_lookup.Conclude();
       return rb->SendError(std::string{requested_index_name} + ": no such global hnsw index");
-    if (auto err = ValidateHnswKnnBlob(profile_knn, *hnsw_index))
+    }
+    if (auto err = ValidateHnswKnnBlob(profile_knn, *hnsw_index)) {
+      index_lookup.Conclude();
       return rb->SendError(*err);
+    }
 
     std::vector<SearchResult> search_results(shards_count);
     std::vector<SearchResult> profile_search_results(shards_count);
@@ -3563,6 +3602,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
     if (needs_global_stats) {
       if (!CollectGlobalScoringStats(index_name, search_algo, cmd_cntx->tx(), shards_count,
                                      global_scoring_stats)) {
+        index_lookup.Conclude();
         return rb->SendError(std::string{requested_index_name} + ": no such index");
       }
       global_stats_ptr = &global_scoring_stats;
@@ -3590,6 +3630,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
           false);
 
       if (index_not_found.load(memory_order_relaxed)) {
+        index_lookup.Conclude();
         return rb->SendError(std::string{requested_index_name} + ": no such index");
       }
 
@@ -3598,6 +3639,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
         auto& res = knn_prefilter_docs[shard_id];
         empty_prefilter_result &= res.ids.empty();
         if (res.error) {
+          index_lookup.Conclude();
           return cmd_cntx->SendError(*res.error);
         }
         profile_search_results[shard_id].total_hits = res.total_hits;
@@ -3620,6 +3662,8 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
     }
 
     auto took = absl::Now() - start;
+    // An empty KNN prefilter skips the final search hop.
+    index_lookup.Conclude();
     SendFtProfileSearchResponse(
         *params, search_algo.GetKnnScoreSortOption(), {}, absl::MakeSpan(search_results),
         absl::MakeSpan(profile_search_results), absl::MakeSpan(profile_results), took, rb, limited);
@@ -3634,6 +3678,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
       std::any_of(ranges.begin(), ranges.end(), [&](const search::AstVectorRangeNode* r) {
         return GlobalHnswIndexRegistry::Instance().Exist(index_name, r->field);
       })) {
+    index_lookup.Conclude();
     return rb->SendError(
         "Combining multiple VECTOR_RANGE clauses with an HNSW index is not "
         "supported");
@@ -3646,6 +3691,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
         hnsw_range_holder = search_algo.ExtractVectorRangeAsPrefilter();
         hnsw_range_prefilter = hnsw_range_holder->As<search::AstVectorRangeNode>();
       } else {
+        index_lookup.Conclude();
         return rb->SendError("Combining VECTOR_RANGE with OR/NOT is not supported on HNSW indexes");
       }
     }
@@ -3660,7 +3706,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
   }
 
   if (hnsw_range) {
-    auto hnsw_index = GetValidatedHnswRangeIndex(index_name, hnsw_range, rb);
+    auto hnsw_index = GetValidatedHnswRangeIndex(index_name, hnsw_range, index_lookup, rb);
     if (!hnsw_index)
       return;
 
@@ -3687,6 +3733,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
     if (needs_global_stats) {
       if (!CollectGlobalScoringStats(index_name, search_algo, cmd_cntx->tx(), shards_count,
                                      global_scoring_stats)) {
+        index_lookup.Conclude();
         return rb->SendError(std::string{requested_index_name} + ": no such index");
       }
       global_stats_ptr = &global_scoring_stats;
@@ -3723,7 +3770,8 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
     if (result_is_empty) {
       search_results = prefilter_results;
     } else {
-      auto hnsw_index = GetValidatedHnswRangeIndex(index_name, hnsw_range_prefilter, rb);
+      auto hnsw_index =
+          GetValidatedHnswRangeIndex(index_name, hnsw_range_prefilter, index_lookup, rb);
       if (!hnsw_index)
         return;
       search_results = SearchGlobalHnswIndexRangePrefiltered(hnsw_range_prefilter, hnsw_index,
@@ -3747,6 +3795,7 @@ void CmdFtProfile(CmdArgParser parser, CommandContext* cmd_cntx) {
   if (needs_global_stats) {
     if (!CollectGlobalScoringStats(index_name, search_algo, cmd_cntx->tx(), shards_count,
                                    global_scoring_stats)) {
+      index_lookup.Conclude();
       return rb->SendError(std::string{requested_index_name} + ": no such index");
     }
     global_stats_ptr = &global_scoring_stats;
@@ -3885,19 +3934,23 @@ static void RunHnswAggregateLoad(
 // FT.AGGREGATE over a global HNSW KNN query. Returns false if an error was already sent.
 static bool AggregateHnswKnn(CommandContext* cmd_cntx, AggregateParams& params,
                              search::SearchAlgorithm& search_algo, const search::AstKnnNode* knn,
+                             SearchIndexLookup& index_lookup,
                              std::vector<std::vector<SearchDocData>>& query_results) {
   auto hnsw_index = GlobalHnswIndexRegistry::Instance().Get(params.index, knn->field);
   if (!hnsw_index) {
+    index_lookup.Conclude();
     cmd_cntx->rb()->SendError(string{params.index} + ": no such global hnsw index");
     return false;
   }
 
   const size_t hnsw_width = search::ElementSize(hnsw_index->GetDataType());
   if (knn->blob.empty() || knn->blob.size() % hnsw_width != 0) {
+    index_lookup.Conclude();
     cmd_cntx->rb()->SendError("Parse error of vector parameters");
     return false;
   }
   if (knn->blob.size() != hnsw_index->GetDim() * hnsw_width) {
+    index_lookup.Conclude();
     cmd_cntx->rb()->SendError(
         absl::StrCat("Wrong vector index dimensions, got: ", knn->blob.size() / hnsw_width,
                      ", expected: ", hnsw_index->GetDim()));
@@ -3924,6 +3977,7 @@ static bool AggregateHnswKnn(CommandContext* cmd_cntx, AggregateParams& params,
 static bool AggregateHnswRange(CommandContext* cmd_cntx, AggregateParams& params,
                                search::SearchAlgorithm& search_algo,
                                const search::AstVectorRangeNode* vr,
+                               SearchIndexLookup& index_lookup,
                                std::vector<std::vector<SearchDocData>>& query_results) {
   auto* builder = cmd_cntx->rb();
   search::AstExpr range_holder;
@@ -3931,6 +3985,7 @@ static bool AggregateHnswRange(CommandContext* cmd_cntx, AggregateParams& params
   bool has_prefilter = false;
   if (!search_algo.IsBareVectorRange()) {
     if (!search_algo.IsAndedVectorRange()) {
+      index_lookup.Conclude();
       builder->SendError("Combining VECTOR_RANGE with OR/NOT is not supported on HNSW indexes");
       return false;
     }
@@ -3939,7 +3994,7 @@ static bool AggregateHnswRange(CommandContext* cmd_cntx, AggregateParams& params
     has_prefilter = true;
   }
 
-  auto hnsw_index = GetValidatedHnswRangeIndex(params.index, hnsw_range, builder);
+  auto hnsw_index = GetValidatedHnswRangeIndex(params.index, hnsw_range, index_lookup, builder);
   if (!hnsw_index)
     return false;
 
@@ -4041,21 +4096,26 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
           std::any_of(ranges.begin(), ranges.end(), [&](const search::AstVectorRangeNode* r) {
             return GlobalHnswIndexRegistry::Instance().Exist(params->index, r->field);
           })) {
+        index_lookup.Conclude();
         return builder->SendError(
             "Combining multiple VECTOR_RANGE clauses with an HNSW index is not supported");
       }
     }
 
     if (knn) {
-      if (!AggregateHnswKnn(cmd_cntx, params.value(), search_algo, knn, query_results))
+      if (!AggregateHnswKnn(cmd_cntx, params.value(), search_algo, knn, index_lookup,
+                            query_results))
         return;
     } else if (auto* vr = search_algo.GetVectorRangeNode(); vr) {
       if (GlobalHnswIndexRegistry::Instance().Exist(params->index, vr->field)) {
-        if (!AggregateHnswRange(cmd_cntx, params.value(), search_algo, vr, query_results))
+        if (!AggregateHnswRange(cmd_cntx, params.value(), search_algo, vr, index_lookup,
+                                query_results))
           return;
       } else {
-        if (vr->epsilon)
+        if (vr->epsilon) {
+          index_lookup.Conclude();
           return builder->SendError("EPSILON is supported only for HNSW VECTOR_RANGE");
+        }
         AggregateGeneric(cmd_cntx, params.value(), search_algo, query_results);
       }
     } else {
