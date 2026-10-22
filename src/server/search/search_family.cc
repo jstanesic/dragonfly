@@ -2866,16 +2866,14 @@ void CmdFtInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
   vector<DocIndexInfo> infos(shard_set->size());
 
   cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
-    auto* index = es->search_indices()->GetIndex(idx_name);
-    if (index != nullptr)
+    if (const auto* index = es->search_indices()->ResolveIndex(idx_name); index != nullptr)
       infos[es->shard_id()] = index->GetInfo();
     return OpStatus::OK;
   });
 
   // Count how many shards didn't find the index by checking empty entries.
-  size_t num_notfound = std::count_if(infos.begin(), infos.end(), [](const DocIndexInfo& info) {
-    return info.base_index.schema.fields.empty();
-  });
+  const size_t num_notfound = ranges::count_if(
+      infos, [](const DocIndexInfo& info) { return info.base_index.schema.fields.empty(); });
 
   DCHECK(num_notfound == 0u || num_notfound == shard_set->size());
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
@@ -2905,7 +2903,7 @@ void CmdFtInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
   rb->StartArray((has_custom_stopwords ? 8 : 7) * 2);
 
   rb->SendSimpleString("index_name");
-  rb->SendSimpleString(idx_name);
+  rb->SendSimpleString(info.base_index.name);
 
   rb->SendSimpleString("index_definition");
   {
@@ -3734,13 +3732,10 @@ void CmdFtTagVals(CmdArgParser parser, CommandContext* cmd_cntx) {
 
   vector<io::Result<StringVec, ErrorReply>> shard_results(shard_set->size(), StringVec{});
 
+  const auto err_reply = make_unexpected(ErrorReply(IndexNotFoundMsg(index_name)));
   cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
-    if (auto* index = es->search_indices()->GetIndex(index_name); index)
-      shard_results[es->shard_id()] = index->GetTagVals(field_name);
-    else
-      shard_results[es->shard_id()] =
-          nonstd::make_unexpected(ErrorReply(IndexNotFoundMsg(index_name)));
-
+    const auto* index = es->search_indices()->ResolveIndex(index_name);
+    shard_results[es->shard_id()] = index ? index->GetTagVals(field_name) : err_reply;
     return OpStatus::OK;
   });
 
@@ -3758,7 +3753,7 @@ void CmdFtTagVals(CmdArgParser parser, CommandContext* cmd_cntx) {
   }
 
   shard_results.clear();
-  vector<string> vec(result_set.begin(), result_set.end());
+  vector vec(result_set.begin(), result_set.end());
 
   rb->SendBulkStrArr(vec, CollectionType::SET);
 }

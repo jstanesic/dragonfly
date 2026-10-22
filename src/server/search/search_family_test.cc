@@ -450,6 +450,40 @@ TEST_F(SearchFamilyTest, AliasCommandsLifecycle) {
   EXPECT_EQ(Run({"FT.ALIASDEL", "upserted"}), "OK");
 }
 
+TEST_F(SearchFamilyTest, AliasCommandsInfoAndTagVals) {
+  ASSERT_THAT(Run({"HSET", "a:1", "color", "red"}), IntArg(1));
+  ASSERT_THAT(Run({"HSET", "b:1", "color", "blue"}), IntArg(1));
+  ASSERT_EQ(
+      Run({"FT.CREATE", "idx-a", "ON", "HASH", "PREFIX", "1", "a:", "SCHEMA", "color", "TAG"}),
+      "OK");
+  ASSERT_EQ(
+      Run({"FT.CREATE", "idx-b", "ON", "HASH", "PREFIX", "1", "b:", "SCHEMA", "color", "TAG"}),
+      "OK");
+  WaitForIndexReady("idx-a");
+  WaitForIndexReady("idx-b");
+
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx-a"}), "OK");
+  pp_->at(0)->Await([] {
+    auto* indices = EngineShard::tlocal()->search_indices();
+    EXPECT_EQ(indices->GetIndex("live"), nullptr);
+    EXPECT_NE(indices->ResolveIndex("live"), nullptr);
+  });
+
+  EXPECT_EQ(map_string("index_name", Run({"FT.INFO", "live"}).GetVec()), "idx-a");
+  EXPECT_THAT(Run({"FT.TAGVALS", "live", "color"}), IsUnordArray("red"));
+
+  ASSERT_EQ(Run({"FT.ALIASUPDATE", "live", "idx-b"}), "OK");
+  EXPECT_EQ(map_string("index_name", Run({"FT.INFO", "live"}).GetVec()), "idx-b");
+  EXPECT_THAT(Run({"FT.TAGVALS", "live", "color"}), IsUnordArray("blue"));
+
+  ASSERT_EQ(Run({"FT.ALIASDEL", "live"}), "OK");
+  EXPECT_THAT(Run({"FT.INFO", "live"}), ErrArg("live: no such index"));
+  EXPECT_THAT(Run({"FT.TAGVALS", "live", "color"}), ErrArg("Index with name 'live' not found"));
+  EXPECT_THAT(Run({"FT.INFO", "missing"}), ErrArg("missing: no such index"));
+  EXPECT_THAT(Run({"FT.TAGVALS", "missing", "color"}),
+              ErrArg("Index with name 'missing' not found"));
+}
+
 TEST_F(SearchFamilyTest, AliasCommandsErrors) {
   ASSERT_EQ(Run({"FT.CREATE", "idx-a", "ON", "HASH", "SCHEMA", "title", "TEXT"}), "OK");
   ASSERT_EQ(Run({"FT.CREATE", "idx-b", "ON", "HASH", "SCHEMA", "title", "TEXT"}), "OK");
