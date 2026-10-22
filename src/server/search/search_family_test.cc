@@ -9684,6 +9684,54 @@ TEST_F(SearchFamilyTest, SynUpdateExpiredDocCrash) {
 
 // --- FT.HYBRID tests ---------------------------------------------------------
 
+TEST_F(SearchFamilyTest, FtProfileSearchAliasTextAndVector) {
+  CreateHnswHashIdx();
+  WaitForIndexReady("idx");
+  const string vec = FloatVec1(1.0f);
+  ASSERT_EQ(Run({"HSET", "h:1", "title", "hello", "vec", vec}), 2);
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+
+  auto text_resp = Run({"FT.PROFILE", "live", "SEARCH", "QUERY", "hello", "NOCONTENT"});
+  ASSERT_ARRAY_OF_TWO_ARRAYS(text_resp);
+  EXPECT_THAT(text_resp.GetVec()[0], AreNoContentDocIds("h:1"));
+
+  auto vector_resp = Run({"FT.PROFILE", "live", "SEARCH", "QUERY", "*=>[KNN 1 @vec $v]",
+                          "NOCONTENT", "PARAMS", "2", "v", vec});
+  ASSERT_ARRAY_OF_TWO_ARRAYS(vector_resp);
+  EXPECT_THAT(vector_resp.GetVec()[0], AreNoContentDocIds("h:1"));
+}
+
+TEST_F(SearchFamilyTest, FtHybridAliasAndProfileAliasReleaseTransactionOnError) {
+  CreateHnswHashIdx();
+  WaitForIndexReady("idx");
+  const string vec = FloatVec1(1.0f);
+  ASSERT_EQ(Run({"HSET", "h:1", "title", "hello", "vec", vec}), 2);
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+
+  auto hybrid = Run({"FT.HYBRID", "live", "SEARCH", "hello", "VSIM", "@vec", "$v", "KNN", "1",
+                     "PARAMS", "2", "v", vec});
+  ASSERT_HYBRID_RESP(hybrid);
+  EXPECT_THAT(HybridKeys(hybrid), ElementsAre("h:1"));
+
+  EXPECT_THAT(Run({"FT.HYBRID", "live", "SEARCH", "hello", "VSIM", "@vec", "$v", "KNN", "1",
+                   "PARAMS", "2", "v", "bad"}),
+              ErrArg("does not match index's expected size"));
+  EXPECT_EQ(Run({"HSET", "h:1", "after-error", "hybrid"}), 1);
+
+  auto profile = Run({"FT.PROFILE", "live", "HYBRID", "QUERY", "SEARCH", "hello", "VSIM", "@vec",
+                      "$v", "KNN", "1", "PARAMS", "2", "v", vec});
+  ASSERT_ARRAY_OF_TWO_ARRAYS(profile);
+  ASSERT_HYBRID_RESP(profile.GetVec()[0]);
+  EXPECT_THAT(HybridKeys(profile.GetVec()[0]), ElementsAre("h:1"));
+
+  EXPECT_THAT(Run({"FT.PROFILE", "live", "HYBRID", "QUERY", "SEARCH", "hello", "VSIM", "@vec", "$v",
+                   "KNN", "1", "PARAMS", "2", "v", "bad"}),
+              ErrArg("does not match index's expected size"));
+  EXPECT_EQ(Run({"HSET", "h:1", "after-error", "profile"}), 0);
+  ASSERT_HYBRID_RESP(Run({"FT.HYBRID", "live", "SEARCH", "hello", "VSIM", "@vec", "$v", "KNN", "1",
+                          "PARAMS", "2", "v", vec}));
+}
+
 TEST_F(SearchFamilyTest, FtHybridStaleDocIdAfterMoveAndHashRewrite) {
   const string vec = FloatVec(1.0f, 1.0f);
 
