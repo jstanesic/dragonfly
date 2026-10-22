@@ -2682,17 +2682,28 @@ void CmdFtCreate(CmdArgParser parser, CommandContext* cmd_cntx) {
     return;
   }
 
-  // Check if index already exists
+  // Check if the name is already occupied by an index or alias.
   atomic_uint exists_cnt = 0;
+  atomic_bool name_is_alias = false;
   cmd_cntx->tx()->Execute(
-      [idx_name, &exists_cnt](auto* tx, auto* es) {
-        if (es->search_indices()->GetIndex(idx_name) != nullptr)
-          exists_cnt.fetch_add(1, std::memory_order_relaxed);
+      [idx_name, &exists_cnt, &name_is_alias](auto* tx, auto* es) {
+        auto* indices = es->search_indices();
+        if (indices->GetIndex(idx_name) != nullptr) {
+          exists_cnt.fetch_add(1, memory_order_relaxed);
+        } else if (indices->ResolveIndex(idx_name) != nullptr) {
+          name_is_alias.store(true, memory_order_relaxed);
+        }
         return OpStatus::OK;
       },
       false);
 
   DCHECK(exists_cnt == 0u || exists_cnt == shard_set->size());
+
+  if (name_is_alias.load(memory_order_relaxed)) {
+    // NX only skips creation for an existing actual index.
+    cmd_cntx->tx()->Conclude();
+    return builder->SendError("Index already exists");
+  }
 
   if (exists_cnt.load(memory_order_relaxed) > 0) {
     cmd_cntx->tx()->Conclude();
@@ -2771,7 +2782,7 @@ void CmdFtAlter(CmdArgParser parser, CommandContext* cmd_cntx) {
   // TODO: Introduce partial rebuild
   const bool is_journal = cmd_cntx->server_conn_cntx()->journal_emulated;
   auto upd_cb = [idx_name, index_info, is_journal](Transaction* tx, EngineShard* es) {
-    unique_ptr<ShardDocIndex> old_index = es->search_indices()->DropIndex(idx_name);
+    unique_ptr<ShardDocIndex> old_index = es->search_indices()->ExtractIndex(idx_name);
     Synonyms synonyms = old_index ? old_index->GetSynonyms() : Synonyms{};
     // Destroying the old index waits for its builder, so the replacement builder never runs next
     // to it on the same global vector index. The old index is already unregistered, so no new
