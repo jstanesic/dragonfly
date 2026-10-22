@@ -3977,6 +3977,12 @@ static void AggregateGeneric(CommandContext* cmd_cntx, AggregateParams& params,
 void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
   auto* builder = cmd_cntx->rb();
 
+  bool needs_conclude = false;
+  absl::Cleanup conclude_tx = [&] {
+    if (needs_conclude)
+      cmd_cntx->tx()->Conclude();
+  };
+
   auto params = ParseAggregatorParams(&parser);
   if (SendErrorIfOccurred(params, &parser, cmd_cntx))
     return;
@@ -3998,6 +4004,20 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
       search_algo.SetScorer(search::ScorerSpec{});
 
     std::vector<std::vector<SearchDocData>> query_results(shard_set->size());
+
+    std::string canonical_index_name{params->index};
+    needs_conclude = true;
+    cmd_cntx->tx()->Execute(
+        [&](Transaction*, EngineShard* es) {
+          if (es->shard_id() == 0) {
+            if (auto* index = es->search_indices()->ResolveIndex(params->index))
+              canonical_index_name = index->base().name;
+          }
+          return OpStatus::OK;
+        },
+        false);
+    // Keep the requested name on a miss to preserve FT.AGGREGATE's empty-result behavior.
+    params->index = canonical_index_name;
 
     auto [knn_node, knn] = TryPopHnswKnnNode(search_algo, params->index);
 
@@ -4027,6 +4047,7 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
     } else {
       AggregateGeneric(cmd_cntx, params.value(), search_algo, query_results);
     }
+    needs_conclude = false;
 
     // ResultContainer is absl::flat_hash_map<std::string, search::SortableValue>
     // DocValues is absl::flat_hash_map<std::string_view, SortableValue>
@@ -4068,6 +4089,23 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
     if (!data_for_join) {
       return cmd_cntx->SendError(data_for_join.error());
     }
+
+    std::vector<std::string> canonical_index_names(indexes_count);
+    needs_conclude = true;
+    cmd_cntx->tx()->Execute(
+        [&](Transaction*, EngineShard* es) {
+          if (es->shard_id() == 0) {
+            for (size_t i = 0; i < indexes_count; ++i) {
+              string_view requested_name = data_for_join->indexes[i];
+              const ShardDocIndex* index = es->search_indices()->ResolveIndex(requested_name);
+              canonical_index_names[i] = index ? index->base().name : requested_name;
+            }
+          }
+          return OpStatus::OK;
+        },
+        false);
+    for (size_t i = 0; i < indexes_count; ++i)
+      data_for_join->indexes[i] = canonical_index_names[i];
 
     // preaggregated_shard_data is preaggregation results per index per shard
     // preaggregated_shard_data[shard_id][i] is the results of index i on shard shard_id
@@ -4120,6 +4158,7 @@ void CmdFtAggregate(CmdArgParser parser, CommandContext* cmd_cntx) {
           return OpStatus::OK;
         },
         true);
+    needs_conclude = false;
 
     // Now we have sets of keys that were joined and keys data.
     // We need to build DocValues for each joined set.

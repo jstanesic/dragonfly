@@ -540,6 +540,56 @@ TEST_F(SearchFamilyTest, FtSearchHnswAliasConcludesTransactions) {
               AreDocIds("d:hit"));
 }
 
+TEST_F(SearchFamilyTest, FtAggregateResolvesAlias) {
+  ASSERT_EQ(Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT"}),
+            "OK");
+  ASSERT_THAT(Run({"HSET", "d:1", "title", "hello"}), IntArg(1));
+  WaitForIndexReady("idx");
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+
+  EXPECT_THAT(Run({"FT.AGGREGATE", "live", "hello", "LOAD", "1", "@title"}),
+              IsUnordArrayWithSize(IsMap("title", "hello")));
+  EXPECT_THAT(Run({"FT.AGGREGATE", "missing_alias", "*"}), RespElementsAre(IntArg(0)));
+}
+
+TEST_F(SearchFamilyTest, FtAggregateHnswAliasConcludesTransactions) {
+  CreateHnswHashIdx();
+  ASSERT_THAT(Run({"HSET", "h:1", "title", "first", "vec", FloatVec1(1.0f)}), IntArg(2));
+  WaitForIndexReady("idx");
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+  const string query = FloatVec1(1.0f);
+
+  EXPECT_THAT(Run({"FT.AGGREGATE", "live", "*=>[KNN 1 @vec $v AS dist]", "PARAMS", "2", "v",
+                   query + query, "DIALECT", "2"}),
+              ErrArg("Wrong vector index dimensions"));
+  EXPECT_THAT(Run({"HSET", "h:1", "title", "updated"}), IntArg(0));
+  EXPECT_THAT(Run({"FT.AGGREGATE", "live", "*=>[KNN 1 @vec $v AS dist]", "PARAMS", "2", "v", query,
+                   "DIALECT", "2", "LOAD", "1", "@title"}),
+              IsUnordArrayWithSize(IsMap("title", "updated")));
+  EXPECT_THAT(Run({"FT.AGGREGATE", "live", "@vec:[VECTOR_RANGE 0.5 $v]", "PARAMS", "2", "v", query,
+                   "LOAD", "1", "@title"}),
+              IsUnordArrayWithSize(IsMap("title", "updated")));
+}
+
+TEST_F(SearchFamilyTest, FtAggregateJoinResolvesAliases) {
+  ASSERT_EQ(
+      Run({"FT.CREATE", "main_idx", "ON", "HASH", "PREFIX", "1", "main:", "SCHEMA", "key", "TAG"}),
+      "OK");
+  ASSERT_EQ(Run({"FT.CREATE", "foreign_idx", "ON", "HASH", "PREFIX", "1", "foreign:", "SCHEMA",
+                 "key", "TAG", "value", "TEXT"}),
+            "OK");
+  ASSERT_THAT(Run({"HSET", "main:1", "key", "same"}), IntArg(1));
+  ASSERT_THAT(Run({"HSET", "foreign:1", "key", "same", "value", "matched"}), IntArg(2));
+  WaitForIndexReady("main_idx");
+  WaitForIndexReady("foreign_idx");
+  ASSERT_EQ(Run({"FT.ALIASADD", "main_live", "main_idx"}), "OK");
+  ASSERT_EQ(Run({"FT.ALIASADD", "foreign_live", "foreign_idx"}), "OK");
+
+  EXPECT_THAT(Run({"FT.AGGREGATE", "main_live", "*", "LOAD", "2", "main_live.key", "other.value",
+                   "LOAD_FROM", "foreign_live", "AS", "other", "1", "other.key=main_live.key"}),
+              IsUnordArrayWithSize(IsMap("main_live.key", "same", "other.value", "matched")));
+}
+
 TEST_F(SearchFamilyTest, AliasCommandsErrors) {
   ASSERT_EQ(Run({"FT.CREATE", "idx-a", "ON", "HASH", "SCHEMA", "title", "TEXT"}), "OK");
   ASSERT_EQ(Run({"FT.CREATE", "idx-b", "ON", "HASH", "SCHEMA", "title", "TEXT"}), "OK");
