@@ -484,6 +484,62 @@ TEST_F(SearchFamilyTest, AliasCommandsInfoAndTagVals) {
               ErrArg("Index with name 'missing' not found"));
 }
 
+TEST_F(SearchFamilyTest, FtSearchResolvesAliasAndReportsRequestedName) {
+  ASSERT_THAT(Run({"HSET", "a:1", "title", "first"}), IntArg(1));
+  ASSERT_THAT(Run({"HSET", "b:1", "title", "second"}), IntArg(1));
+  ASSERT_EQ(
+      Run({"FT.CREATE", "idx-a", "ON", "HASH", "PREFIX", "1", "a:", "SCHEMA", "title", "TEXT"}),
+      "OK");
+  ASSERT_EQ(
+      Run({"FT.CREATE", "idx-b", "ON", "HASH", "PREFIX", "1", "b:", "SCHEMA", "title", "TEXT"}),
+      "OK");
+  WaitForIndexReady("idx-a");
+  WaitForIndexReady("idx-b");
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx-a"}), "OK");
+
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "first"}), AreDocIds("a:1"));
+  ASSERT_EQ(Run({"FT.ALIASUPDATE", "live", "idx-b"}), "OK");
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "second"}), AreDocIds("b:1"));
+  ASSERT_EQ(Run({"FT.ALIASDEL", "live"}), "OK");
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "*"}), ErrArg("live: no such index"));
+}
+
+TEST_F(SearchFamilyTest, FtSearchHnswAliasConcludesTransactions) {
+  auto FloatToBytes = [](float f) {
+    return string(reinterpret_cast<const char*>(&f), sizeof(float));
+  };
+  ASSERT_EQ(Run({"FT.CREATE", "idx",     "ON",  "HASH", "PREFIX",          "1",    "d:",
+                 "SCHEMA",    "route",   "TAG", "pos",  "VECTOR",          "HNSW", "6",
+                 "TYPE",      "FLOAT32", "DIM", "1",    "DISTANCE_METRIC", "L2"}),
+            "OK");
+  ASSERT_THAT(Run({"HSET", "d:hit", "route", "yes", "pos", FloatToBytes(1.0f)}), IntArg(2));
+  ASSERT_THAT(Run({"HSET", "d:filtered", "route", "no", "pos", FloatToBytes(2.0f)}), IntArg(2));
+  WaitForIndexReady("idx");
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+  const string query = FloatToBytes(1.0f);
+
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "* => [KNN 1 @pos $v]", "PARAMS", "2", "v", query}),
+              AreDocIds("d:hit"));
+  EXPECT_THAT(
+      Run({"FT.SEARCH", "live", "@route:{yes} => [KNN 1 @pos $v]", "PARAMS", "2", "v", query}),
+      AreDocIds("d:hit"));
+  EXPECT_THAT(
+      Run({"FT.SEARCH", "live", "@route:{missing} => [KNN 1 @pos $v]", "PARAMS", "2", "v", query}),
+      kNoResults);
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "@pos:[VECTOR_RANGE 0.5 $v]", "PARAMS", "2", "v", query}),
+              AreDocIds("d:hit"));
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "(@pos:[VECTOR_RANGE 0.5 $v] @route:{yes})", "PARAMS", "2",
+                   "v", query}),
+              AreDocIds("d:hit"));
+
+  EXPECT_THAT(
+      Run({"FT.SEARCH", "live", "@route:{yes} => [KNN 1 @pos $v]", "PARAMS", "2", "v", "bad"}),
+      ErrArg("Parse error of vector parameters"));
+  EXPECT_THAT(Run({"HSET", "d:hit", "extra", "after-error"}), IntArg(1));
+  EXPECT_THAT(Run({"FT.SEARCH", "live", "* => [KNN 1 @pos $v]", "PARAMS", "2", "v", query}),
+              AreDocIds("d:hit"));
+}
+
 TEST_F(SearchFamilyTest, AliasCommandsErrors) {
   ASSERT_EQ(Run({"FT.CREATE", "idx-a", "ON", "HASH", "SCHEMA", "title", "TEXT"}), "OK");
   ASSERT_EQ(Run({"FT.CREATE", "idx-b", "ON", "HASH", "SCHEMA", "title", "TEXT"}), "OK");
