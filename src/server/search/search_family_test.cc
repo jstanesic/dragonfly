@@ -3975,6 +3975,20 @@ TEST_F(SearchFamilyTest, SynonymManagement) {
                                  IsArray("1"), "tiger", IsArray("3"), "cat", IsArray("1")));
 }
 
+TEST_F(SearchFamilyTest, SynonymCommandsResolveAliases) {
+  ASSERT_EQ(
+      Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA", "title", "TEXT"}),
+      "OK");
+  WaitForIndexReady("idx");
+  ASSERT_THAT(Run({"HSET", "doc:1", "title", "cat"}), IntArg(1));
+  ASSERT_EQ(Run({"FT.ALIASADD", "live", "idx"}), "OK");
+
+  EXPECT_EQ(Run({"FT.SYNUPDATE", "live", "animals", "cat", "feline"}), "OK");
+  EXPECT_THAT(Run({"FT.SYNDUMP", "live"}),
+              IsUnordArray("cat", IsArray("animals"), "feline", IsArray("animals")));
+  EXPECT_THAT(Run({"FT.SEARCH", "idx", "feline"}), AreDocIds("doc:1"));
+}
+
 TEST_F(SearchFamilyTest, SynonymsSearch) {
   // Create search index
   auto resp =
